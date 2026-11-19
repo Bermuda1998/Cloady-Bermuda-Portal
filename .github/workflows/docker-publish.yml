@@ -1,0 +1,99 @@
+name: Build and Publish Docker Image
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Verify Required Build Assets
+        run: |
+          if [ ! -s "./bermuda.jpg" ]; then
+            echo "::error::bermuda.jpg is missing or empty (required by //go:embed in proxy.go)"
+            exit 1
+          fi
+
+      - name: Prepare Registry Tags
+        id: meta
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          GHCR_ID=$(printf '%s' "ghcr.io/${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          TAGS="${GHCR_ID}:latest"
+          if [ "${REF_TYPE}" = "tag" ] && [ -n "${REF_NAME}" ]; then
+            SAFE_TAG=$(printf '%s' "${REF_NAME}" | tr '[:upper:]' '[:lower:]')
+            TAGS="${TAGS}"$'\n'"${GHCR_ID}:${SAFE_TAG}"
+          fi
+
+          if [ -n "${DH_USER}" ] && [ -n "${DH_TOKEN}" ]; then
+            DH_ID=$(printf '%s' "docker.io/${DH_USER}/${REPO_NAME}" | tr '[:upper:]' '[:lower:]')
+            TAGS="${TAGS}"$'\n'"${DH_ID}:latest"
+            if [ "${REF_TYPE}" = "tag" ] && [ -n "${REF_NAME}" ]; then
+              SAFE_TAG=$(printf '%s' "${REF_NAME}" | tr '[:upper:]' '[:lower:]')
+              TAGS="${TAGS}"$'\n'"${DH_ID}:${SAFE_TAG}"
+            fi
+            echo "has_dh=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_dh=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          {
+            echo "tags<<EOF"
+            printf '%s\n' "${TAGS}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: steps.meta.outputs.has_dh == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and Push Multi-Arch Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: ${{ steps.meta.outputs.tags }}
