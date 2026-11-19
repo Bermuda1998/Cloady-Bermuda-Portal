@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+
 FROM --platform=$BUILDPLATFORM golang:1.27-alpine3.24 AS builder
 
 ARG TARGETOS=linux
@@ -6,22 +8,9 @@ ARG TARGETARCH=amd64
 RUN apk add --no-cache ca-certificates curl unzip
 
 WORKDIR /src
-COPY go.mod ./
-COPY *.go ./
-COPY bermuda.jpg ./
 
-ENV CGO_ENABLED=0 \
-    GOTOOLCHAIN=auto
-
-RUN set -eux; \
-    test -s ./bermuda.jpg; \
-    case "${TARGETARCH:-amd64}" in \
-      arm64) export GOARCH=arm64 GOARM64=v8.0 ;; \
-      *)     export GOARCH=amd64 GOAMD64=v2 ;; \
-    esac; \
-    GOOS="${TARGETOS:-linux}" go build -trimpath -tags netgo,osusergo -ldflags="-s -w -buildid=" \
-      -o /out/usr/local/bin/bermuda-portal .
-
+# Stage 1: Fetch and SHA-256 verify upstream routing worker per TARGETARCH.
+# Placed before COPY *.go so Buildx GHA cache reuses this layer across Go code edits.
 RUN set -eux; \
     mkdir -p /out/usr/local/bin /out/usr/local/share/router-assets /tmp/rt; \
     case "${TARGETARCH:-amd64}" in \
@@ -39,10 +28,12 @@ RUN set -eux; \
       "https://github.com/XTLS/Xray-core/releases/download/v26.7.28"; \
     do \
       rm -f /tmp/rt/worker.zip /tmp/rt/worker.zip.dgst; \
-      if curl -fsSL --retry 2 --connect-timeout 15 "${CANDIDATE}/${ARCHIVE}" -o /tmp/rt/worker.zip && \
-         curl -fsSL --retry 2 --connect-timeout 10 "${CANDIDATE}/${ARCHIVE}.dgst" -o /tmp/rt/worker.zip.dgst; then \
-        EXPECTED_SHA=$(awk -F'= *' 'toupper($1) ~ /SHA2-256|SHA256/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' /tmp/rt/worker.zip.dgst); \
-        if printf '%s\n' "${EXPECTED_SHA}" | grep -Eq '^[0-9A-Fa-f]{64}$' && \
+      if curl -fsSL --retry 2 --retry-delay 2 --connect-timeout 15 --max-time 90 \
+           "${CANDIDATE}/${ARCHIVE}" -o /tmp/rt/worker.zip && \
+         curl -fsSL --retry 2 --retry-delay 2 --connect-timeout 10 --max-time 30 \
+           "${CANDIDATE}/${ARCHIVE}.dgst" -o /tmp/rt/worker.zip.dgst; then \
+        EXPECTED_SHA=$(awk -F'= *' 'toupper($1) ~ /SHA2-256|SHA256/ {gsub(/[[:space:]]/, "", $2); print tolower($2); exit}' /tmp/rt/worker.zip.dgst); \
+        if printf '%s\n' "${EXPECTED_SHA}" | grep -Eq '^[0-9a-f]{64}$' && \
            printf '%s  %s\n' "${EXPECTED_SHA}" "/tmp/rt/worker.zip" | sha256sum -c -; then \
           DOWNLOADED=1; \
           break; \
@@ -55,18 +46,41 @@ RUN set -eux; \
     fi; \
     unzip -q /tmp/rt/worker.zip -d /tmp/rt; \
     mv /tmp/rt/xray /out/usr/local/bin/router-worker; \
-    head -c 32 /dev/urandom >> /out/usr/local/bin/router-worker; \
     chmod 0755 /out/usr/local/bin/router-worker; \
     mv /tmp/rt/geoip.dat /out/usr/local/share/router-assets/geoip.dat; \
     mv /tmp/rt/geosite.dat /out/usr/local/share/router-assets/geosite.dat; \
     chmod 0644 /out/usr/local/share/router-assets/*.dat; \
+    test -s /out/usr/local/bin/router-worker; \
+    test -s /out/usr/local/share/router-assets/geoip.dat; \
+    test -s /out/usr/local/share/router-assets/geosite.dat; \
     rm -rf /tmp/rt
+
+# Stage 2: Cross-compile Go gateway natively on BUILDPLATFORM & mutate worker hash
+COPY go.mod ./
+COPY bermuda.jpg ./
+COPY *.go ./
+
+ENV CGO_ENABLED=0 \
+    GOTOOLCHAIN=auto
+
+RUN set -eux; \
+    test -s ./bermuda.jpg; \
+    case "${TARGETARCH:-amd64}" in \
+      arm64) export GOARCH=arm64 GOARM64=v8.0 ;; \
+      *)     export GOARCH=amd64 GOAMD64=v2 ;; \
+    esac; \
+    GOOS="${TARGETOS:-linux}" go build -trimpath -tags netgo,osusergo -ldflags="-s -w -buildid=" \
+      -o /out/usr/local/bin/bermuda-portal .; \
+    chmod 0755 /out/usr/local/bin/bermuda-portal; \
+    head -c 32 /dev/urandom >> /out/usr/local/bin/router-worker; \
+    test -s /out/usr/local/bin/bermuda-portal; \
+    test -s /out/usr/local/bin/router-worker
 
 FROM alpine:3.24
 
 RUN apk add --no-cache ca-certificates tzdata && \
     update-ca-certificates && \
-    mkdir -p /tmp/bm-runtime && \
+    mkdir -p /app /tmp/bm-runtime && \
     chmod 1777 /tmp/bm-runtime
 
 WORKDIR /app
@@ -77,9 +91,10 @@ COPY --from=builder /out/usr/local/share/router-assets /usr/local/share/router-a
 
 ENV PORT=8080 \
     BERMUDA_LISTEN_PORT=8080 \
-    BERMUDA_ASSET_DIR=/usr/local/share/router-assets
+    BERMUDA_ASSET_DIR=/usr/local/share/router-assets \
+    TZ=UTC
 
-EXPOSE 8080 3000 80
+EXPOSE 8080
 
 STOPSIGNAL SIGTERM
 
