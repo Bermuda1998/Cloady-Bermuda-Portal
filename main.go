@@ -264,15 +264,15 @@ func normalizeOptionalRegion(raw string) string {
 		return ""
 	}
 	switch {
-	case s == "eu1" || strings.Contains(s, "de-fra") || strings.Contains(s, "frankfurt") || strings.Contains(s, "germany") || strings.Contains(s, "eu-central") || strings.Contains(s, "europe"):
+	case s == "eu1" || s == "de" || strings.Contains(s, "de-fra") || strings.Contains(s, "frankfurt") || strings.Contains(s, "nuremberg") || strings.Contains(s, "germany") || strings.Contains(s, "eu-central") || strings.Contains(s, "europe"):
 		return "eu1"
 	case s == "uk1" || strings.Contains(s, "uk-lon") || strings.Contains(s, "london") || strings.Contains(s, "united kingdom") || s == "uk" || s == "gb":
 		return "uk1"
-	case s == "use1" || strings.Contains(s, "us-east") || strings.Contains(s, "virginia") || strings.Contains(s, "nyc") || strings.Contains(s, "ashburn"):
+	case s == "use1" || strings.Contains(s, "us-east") || strings.Contains(s, "us east") || strings.Contains(s, "virginia") || strings.Contains(s, "nyc") || strings.Contains(s, "ashburn") || strings.Contains(s, "new york"):
 		return "use1"
-	case s == "usc1" || strings.Contains(s, "us-central") || strings.Contains(s, "dallas") || strings.Contains(s, "chicago") || strings.Contains(s, "iowa"):
+	case s == "usc1" || strings.Contains(s, "us-central") || strings.Contains(s, "us central") || strings.Contains(s, "dallas") || strings.Contains(s, "chicago") || strings.Contains(s, "iowa") || strings.Contains(s, "st. louis"):
 		return "usc1"
-	case s == "usw1" || strings.Contains(s, "us-west") || strings.Contains(s, "california") || strings.Contains(s, "oregon") || strings.Contains(s, "sjc") || strings.Contains(s, "lax"):
+	case s == "usw1" || strings.Contains(s, "us-west") || strings.Contains(s, "us west") || strings.Contains(s, "california") || strings.Contains(s, "oregon") || strings.Contains(s, "sjc") || strings.Contains(s, "lax") || strings.Contains(s, "seattle"):
 		return "usw1"
 	case s == "sin1" || strings.Contains(s, "singapore") || strings.Contains(s, "asia-southeast") || strings.Contains(s, "sg-sin") || s == "sg":
 		return "sin1"
@@ -362,9 +362,17 @@ func orchestrateCloudInfrastructure(
 
 	startCL := cleanHost(initialCL)
 	startCF := cleanHost(initialCF)
+	startReg := normalizeOptionalRegion(initialRegion)
+
+	// When initialRegion was empty at boot, supervisor.go's initial 398ms BMB1 banner defaulted to "eu1".
+	initialBannerReg := startReg
+	if initialBannerReg == "" {
+		initialBannerReg = "eu1"
+	}
+
 	cloadyDomain := startCL
 	customDomain := startCF
-	region := normalizeOptionalRegion(initialRegion)
+	region := startReg
 
 	if curCL, curCF, curReg := sup.GetInfrastructureDomains(); cloadyDomain == "" || customDomain == "" || region == "" {
 		if cloadyDomain == "" && isCloadyPublicDomain(curCL) {
@@ -448,11 +456,19 @@ func orchestrateCloudInfrastructure(
 		probeCancel()
 	}
 
+	// Zero-Token GeoIP fallback if region is still unresolved after API check
+	if region == "" && ctx.Err() == nil {
+		if geoReg := probeOutboundCloadyRegion(ctx); geoReg != "" {
+			region = geoReg
+			log.Printf("[Cloady] ✓ Auto-detected container egress region: %s", region)
+		}
+	}
+
 	if region == "" {
 		region = "eu1"
-		sup.SetInfrastructureDomains(cloadyDomain, customDomain, region)
-		gw.SetInfrastructureDomains(cloadyDomain, customDomain, region)
 	}
+	sup.SetInfrastructureDomains(cloadyDomain, customDomain, region)
+	gw.SetInfrastructureDomains(cloadyDomain, customDomain, region)
 
 	autoOrange := !strings.EqualFold(getEnv("BERMUDA_CF_AUTO_ORANGE", "true"), "false")
 	if cf != nil && !autoOrange {
@@ -531,22 +547,41 @@ func orchestrateCloudInfrastructure(
 
 	if ctx.Err() == nil {
 		cl.TuneComputeAndNetwork(ctx)
+		if cl != nil {
+			if srvDom := cleanHost(cl.GetServiceDomain()); isCloadyPublicDomain(srvDom) {
+				syncDomains(srvDom, "")
+			}
+			if reg := normalizeOptionalRegion(cl.GetDiscoveredRegion()); reg != "" && reg != region {
+				region = reg
+				sup.SetInfrastructureDomains(cloadyDomain, customDomain, region)
+				gw.SetInfrastructureDomains(cloadyDomain, customDomain, region)
+			}
+		}
 	}
 
 	// Re-sync in case proxy.go learned the live *.cloady.io domain from an incoming request during orchestration
-	if curCL, curCF, _ := sup.GetInfrastructureDomains(); (cloadyDomain == "" && curCL != "") || (customDomain == "" && curCF != "") {
+	if curCL, curCF, curReg := sup.GetInfrastructureDomains(); (cloadyDomain == "" && curCL != "") || (customDomain == "" && curCF != "") || (region == "" && curReg != "") {
 		if cloadyDomain == "" && isCloadyPublicDomain(curCL) {
 			cloadyDomain = curCL
 		}
 		if customDomain == "" && curCF != "" && !isCloadyManagedDomain(curCF) {
 			customDomain = curCF
 		}
+		if region == "" && curReg != "" {
+			region = normalizeOptionalRegion(curReg)
+		}
+		sup.SetInfrastructureDomains(cloadyDomain, customDomain, region)
+		gw.SetInfrastructureDomains(cloadyDomain, customDomain, region)
 	}
 
 	if ctx.Err() == nil {
 		log.Printf("[Runtime] Synchronized Topology: CloadyDomain=%q | CloudflareDomain=%q | Region=%q",
 			cloadyDomain, customDomain, region)
-		if domainDiscovered && (cloadyDomain != startCL || customDomain != startCF) {
+
+		regionUpdated := region != "" && region != initialBannerReg
+		domainUpdated := domainDiscovered && (cloadyDomain != startCL || customDomain != startCF)
+
+		if domainUpdated || (regionUpdated && (cloadyDomain != "" || customDomain != "")) {
 			sup.LogProvisioningLink("")
 		} else if cloadyDomain == "" && customDomain == "" {
 			log.Printf("[Runtime] Direct Mode Ready: Open https://<your-app>.cloady.io/?bmk=%s in your browser (or paste your *.cloady.io subdomain alongside the BMB1 token in index.html).",
@@ -767,7 +802,11 @@ func main() {
 
 	initialRegion := explicitRegion
 	if initialRegion == "" && cl == nil {
-		initialRegion = normalizeRegion(rawRegion)
+		if geoReg := probeOutboundCloadyRegion(sigCtx); geoReg != "" {
+			initialRegion = geoReg
+		} else {
+			initialRegion = normalizeRegion(rawRegion)
+		}
 	}
 
 	sup.SetInfrastructureDomains(cloadyDomain, customDomain, initialRegion)
@@ -791,6 +830,11 @@ func main() {
 
 	topologyUpdater := func(clDom, cfDom string) {
 		_, _, curReg := sup.GetInfrastructureDomains()
+		if cl != nil {
+			if discReg := normalizeOptionalRegion(cl.GetDiscoveredRegion()); discReg != "" {
+				curReg = discReg
+			}
+		}
 		sup.SetInfrastructureDomains(clDom, cfDom, curReg)
 		gw.SetInfrastructureDomains(clDom, cfDom, curReg)
 	}
