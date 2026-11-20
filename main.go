@@ -186,7 +186,7 @@ func sleepContext(ctx context.Context, d time.Duration) bool {
 
 func cleanHost(h string) string {
 	h = strings.TrimSpace(h)
-	if strings.HasPrefix(h, "${{") || strings.HasPrefix(h, "$") {
+	if h == "" || strings.Contains(h, "${") || strings.HasPrefix(h, "$") || strings.Contains(h, "}") {
 		return ""
 	}
 	h = strings.TrimPrefix(h, "https://")
@@ -209,7 +209,8 @@ func isCloadyCnameAlias(h string) bool {
 	switch h {
 	case "cloady.io", "cloady.com", "cloady.internal",
 		"ssh.cloady.io", "api.cloady.io", "api.cloady.com",
-		"app.cloady.com", "docs.cloady.com", "www.cloady.com", "www.cloady.io":
+		"app.cloady.com", "docs.cloady.com", "www.cloady.com", "www.cloady.io",
+		"ns1.cloady.io", "ns2.cloady.io":
 		return true
 	}
 	return strings.HasSuffix(h, ".cloady.internal") ||
@@ -259,7 +260,7 @@ func isFullCloadyServiceDomain(h string) bool {
 
 func normalizeOptionalRegion(raw string) string {
 	s := strings.ToLower(strings.TrimSpace(raw))
-	if s == "" || strings.Contains(s, "${{") || strings.HasPrefix(s, "$") {
+	if s == "" || strings.Contains(s, "${") || strings.HasPrefix(s, "$") {
 		return ""
 	}
 	switch {
@@ -294,10 +295,10 @@ func normalizeRegion(raw string) string {
 }
 
 func resolveInfrastructureDomains() (cloadyDomain, customDomain string) {
+	explicitCloady := cleanHost(getEnv("BERMUDA_CLOADY_DOMAIN", ""))
 	primaryHost := cleanHost(getEnv("CLOADY_PRIMARY_HOST", ""))
 	primaryURL := cleanHost(getEnv("CLOADY_PRIMARY_URL", getEnv("CLOADY_URL", "")))
 	publicDomain := cleanHost(getEnv("CLOADY_DOMAIN", ""))
-	explicitCloady := cleanHost(getEnv("BERMUDA_CLOADY_DOMAIN", ""))
 	customEnv := cleanHost(getEnv("CUSTOM_DOMAIN", getEnv("BERMUDA_CUSTOM_DOMAIN", "")))
 
 	clCandidates := []string{explicitCloady, primaryHost, primaryURL, publicDomain}
@@ -326,6 +327,19 @@ func resolveInfrastructureDomains() (cloadyDomain, customDomain string) {
 	return cloadyDomain, customDomain
 }
 
+func resolveCloadyAPIToken() string {
+	if tok := sanitizeCloadyToken(getEnv("CLOADY_API_TOKEN", "")); tok != "" {
+		return tok
+	}
+	if tok := sanitizeCloadyToken(getEnv("BERMUDA_CLOADY_TOKEN", "")); tok != "" {
+		return tok
+	}
+	if tok := sanitizeCloadyToken(getEnv("CLOADY_TOKEN", "")); isValidCloadyTokenFormat(tok) {
+		return tok
+	}
+	return ""
+}
+
 func orchestrateCloudInfrastructure(
 	ctx context.Context,
 	sup *Supervisor,
@@ -346,8 +360,10 @@ func orchestrateCloudInfrastructure(
 		return
 	}
 
-	cloadyDomain := cleanHost(initialCL)
-	customDomain := cleanHost(initialCF)
+	startCL := cleanHost(initialCL)
+	startCF := cleanHost(initialCF)
+	cloadyDomain := startCL
+	customDomain := startCF
 	region := normalizeOptionalRegion(initialRegion)
 
 	if curCL, curCF, curReg := sup.GetInfrastructureDomains(); cloadyDomain == "" || customDomain == "" || region == "" {
@@ -362,7 +378,7 @@ func orchestrateCloudInfrastructure(
 		}
 	}
 
-	topologyUpdated := false
+	domainDiscovered := false
 
 	syncDomains := func(newCL, newCF string) {
 		cleanCL := cleanHost(newCL)
@@ -371,7 +387,7 @@ func orchestrateCloudInfrastructure(
 			if cloadyDomain == "" || (!isFullCloadyServiceDomain(cloadyDomain) && isFullCloadyServiceDomain(cleanCL)) {
 				if cloadyDomain != cleanCL {
 					cloadyDomain = cleanCL
-					topologyUpdated = true
+					domainDiscovered = true
 				}
 			}
 		}
@@ -379,7 +395,7 @@ func orchestrateCloudInfrastructure(
 			if customDomain == "" || strings.HasSuffix(cleanCF, "."+customDomain) {
 				if customDomain != cleanCF {
 					customDomain = cleanCF
-					topologyUpdated = true
+					domainDiscovered = true
 				}
 			}
 		}
@@ -417,7 +433,6 @@ func orchestrateCloudInfrastructure(
 
 		if reg := normalizeOptionalRegion(cl.GetDiscoveredRegion()); reg != "" && reg != region {
 			region = reg
-			topologyUpdated = true
 			sup.SetInfrastructureDomains(cloadyDomain, customDomain, region)
 			gw.SetInfrastructureDomains(cloadyDomain, customDomain, region)
 		}
@@ -437,12 +452,6 @@ func orchestrateCloudInfrastructure(
 		region = "eu1"
 		sup.SetInfrastructureDomains(cloadyDomain, customDomain, region)
 		gw.SetInfrastructureDomains(cloadyDomain, customDomain, region)
-	}
-
-	if topologyUpdated && ctx.Err() == nil {
-		log.Printf("[Runtime] Synchronized Topology: CloadyDomain=%q | CloudflareDomain=%q | Region=%q",
-			cloadyDomain, customDomain, region)
-		sup.LogProvisioningLink("")
 	}
 
 	autoOrange := !strings.EqualFold(getEnv("BERMUDA_CF_AUTO_ORANGE", "true"), "false")
@@ -478,7 +487,6 @@ func orchestrateCloudInfrastructure(
 			}
 		}
 
-		// Hold Grey Cloud before cf.Tune runs whenever Cloady TLS is not yet verified or autoOrange is disabled
 		if cf != nil && (customDomInfo == nil || !customDomInfo.IsCertificateValid() || !autoOrange) {
 			cf.SetHoldGreyCloud(true)
 		}
@@ -521,14 +529,29 @@ func orchestrateCloudInfrastructure(
 		}
 	}
 
-	if cl != nil && cl.IsConfigured() && ctx.Err() == nil {
+	if ctx.Err() == nil {
 		cl.TuneComputeAndNetwork(ctx)
+	}
+
+	// Re-sync in case proxy.go learned the live *.cloady.io domain from an incoming request during orchestration
+	if curCL, curCF, _ := sup.GetInfrastructureDomains(); (cloadyDomain == "" && curCL != "") || (customDomain == "" && curCF != "") {
+		if cloadyDomain == "" && isCloadyPublicDomain(curCL) {
+			cloadyDomain = curCL
+		}
+		if customDomain == "" && curCF != "" && !isCloadyManagedDomain(curCF) {
+			customDomain = curCF
+		}
 	}
 
 	if ctx.Err() == nil {
 		log.Printf("[Runtime] Synchronized Topology: CloadyDomain=%q | CloudflareDomain=%q | Region=%q",
 			cloadyDomain, customDomain, region)
-		sup.LogProvisioningLink("")
+		if domainDiscovered && (cloadyDomain != startCL || customDomain != startCF) {
+			sup.LogProvisioningLink("")
+		} else if cloadyDomain == "" && customDomain == "" {
+			log.Printf("[Runtime] Direct Mode Ready: Open https://<your-app>.cloady.io/?bmk=%s in your browser (or paste your *.cloady.io subdomain alongside the BMB1 token in index.html).",
+				sup.MasterKey())
+		}
 	}
 }
 
@@ -726,18 +749,20 @@ func main() {
 		log.Println("[Cloudflare] Notice: CLOUDFLARE_API_TOKEN unset. Edge auto-tuning bypassed.")
 	}
 
-	clToken := sanitizeCloadyToken(getEnv("CLOADY_API_TOKEN", getEnv("CLOADY_TOKEN", getEnv("BERMUDA_CLOADY_TOKEN", ""))))
+	clToken := resolveCloadyAPIToken()
 	var cl *CloadyClient
 	if clToken != "" {
 		cl = NewCloadyClient(clToken)
-		if cloadyDomain != "" {
-			cl.SetServiceDomain(cloadyDomain)
-		}
-		if customDomain != "" {
-			cl.SetCustomDomain(customDomain)
+		if cl != nil {
+			if cloadyDomain != "" {
+				cl.SetServiceDomain(cloadyDomain)
+			}
+			if customDomain != "" {
+				cl.SetCustomDomain(customDomain)
+			}
 		}
 	} else {
-		log.Println("[Cloady] Notice: CLOADY_API_TOKEN unset. Cloady API self-provisioning bypassed.")
+		log.Println("[Cloady] Notice: CLOADY_API_TOKEN unset. Running in Zero-Token Direct Mode (auto-discovers *.cloady.io on first request).")
 	}
 
 	initialRegion := explicitRegion
@@ -842,9 +867,7 @@ func main() {
 
 	cloudCtx, cloudCancel := context.WithCancel(sigCtx)
 	defer cloudCancel()
-	if cl != nil || cf != nil {
-		go orchestrateCloudInfrastructure(cloudCtx, sup, gw, cl, cf, cloadyDomain, customDomain, initialRegion)
-	}
+	go orchestrateCloudInfrastructure(cloudCtx, sup, gw, cl, cf, cloadyDomain, customDomain, initialRegion)
 
 	select {
 	case err := <-serverErrCh:
