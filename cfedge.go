@@ -125,7 +125,7 @@ func sanitizeCloudflareToken(raw string) string {
 		}
 		return r
 	}, s)
-	if strings.Contains(s, "${{") || strings.HasPrefix(s, "$") {
+	if strings.Contains(s, "${") || strings.HasPrefix(s, "$") {
 		return ""
 	}
 	return s
@@ -224,7 +224,7 @@ func (c *CloudflareClient) SetCloadyOrigin(d string) {
 		return
 	}
 	c.mu.Lock()
-	if c.cloadyOrigin == "" || (!isFullCloadyServiceDomain(c.cloadyOrigin) && isFullCloadyServiceDomain(clean)) || isFullCloadyServiceDomain(clean) {
+	if c.cloadyOrigin == "" || !isFullCloadyServiceDomain(c.cloadyOrigin) || isFullCloadyServiceDomain(clean) {
 		c.cloadyOrigin = clean
 	}
 	c.mu.Unlock()
@@ -395,15 +395,15 @@ func (c *CloudflareClient) discoverTopologyFromDNS(ctx context.Context, zoneID, 
 		} else if isFullCloadyServiceDomain(matchedCLTarget) {
 			bestCL = matchedCLTarget
 		} else if bestCL == "" {
-			if commentCLTarget != "" {
+			if isCloadyPublicDomain(commentCLTarget) {
 				bestCL = commentCLTarget
-			} else if matchedCLTarget != "" {
+			} else if isCloadyPublicDomain(matchedCLTarget) {
 				bestCL = matchedCLTarget
 			}
 		}
 	}
 
-	if bestCL != "" && bestCL != c.cloadyOrigin {
+	if isCloadyPublicDomain(bestCL) && bestCL != c.cloadyOrigin {
 		c.cloadyOrigin = bestCL
 		updated = true
 		log.Printf("[Cloudflare] ✓ Auto-discovered Cloady Service Domain from DNS: %s", bestCL)
@@ -727,12 +727,12 @@ func (c *CloudflareClient) ProvisionCloadyDNS(ctx context.Context, info *CloadyC
 
 	clOrigin := c.GetCloadyOrigin()
 	var commentTag string
-	if isFullCloadyServiceDomain(clOrigin) {
+	if isCloadyPublicDomain(clOrigin) {
 		candidate := bermudaCLCommentPrefix + clOrigin
 		if len(candidate) <= 95 {
 			commentTag = candidate
 		}
-	} else if isFullCloadyServiceDomain(cnameTarget) {
+	} else if isCloadyPublicDomain(cnameTarget) {
 		candidate := bermudaCLCommentPrefix + cnameTarget
 		if len(candidate) <= 95 {
 			commentTag = candidate
@@ -899,7 +899,7 @@ func (c *CloudflareClient) PromoteCustomDomainToOrangeCloud(ctx context.Context,
 
 	clOrigin := c.GetCloadyOrigin()
 	var commentTag string
-	if isFullCloadyServiceDomain(clOrigin) {
+	if isCloadyPublicDomain(clOrigin) {
 		candidate := bermudaCLCommentPrefix + clOrigin
 		if len(candidate) <= 95 {
 			commentTag = candidate
@@ -995,7 +995,7 @@ func (c *CloudflareClient) ensureDNSConfiguration(ctx context.Context, zoneID, z
 		isCloadyTarget := isCloadyManagedDomain(recContent) || (clOrigin != "" && recContent == clOrigin)
 
 		if isCloadyManagedDomain(recContent) {
-			if (clOrigin == "" || !isFullCloadyServiceDomain(clOrigin)) && isFullCloadyServiceDomain(recContent) {
+			if (clOrigin == "" || !isFullCloadyServiceDomain(clOrigin)) && isCloadyPublicDomain(recContent) {
 				clOrigin = recContent
 				c.SetCloadyOrigin(recContent)
 				topologyChanged = true
@@ -1008,7 +1008,7 @@ func (c *CloudflareClient) ensureDNSConfiguration(ctx context.Context, zoneID, z
 		}
 
 		wantComment := rec.Comment
-		if isCloadyTarget && isFullCloadyServiceDomain(clOrigin) {
+		if isCloadyTarget && isCloadyPublicDomain(clOrigin) {
 			expectedTag := bermudaCLCommentPrefix + clOrigin
 			if extractCommentCloadyDomain(rec.Comment) != clOrigin && len(expectedTag) <= 95 {
 				wantComment = expectedTag
@@ -1017,8 +1017,6 @@ func (c *CloudflareClient) ensureDNSConfiguration(ctx context.Context, zoneID, z
 
 		needsProxyPatch := !holdingGrey && autoOrange && (isTargetHost || isCloadyTarget) && rec.Proxiable && !rec.Proxied
 
-		// Safety guard: before promoting an unproxied Cloady CNAME to Orange Cloud,
-		// verify that Cloady's Let's Encrypt certificate is already active on the origin.
 		if needsProxyPatch && isCloadyTarget {
 			probeGateway := recContent
 			if !isCloadyPublicDomain(probeGateway) && isCloadyPublicDomain(clOrigin) {
