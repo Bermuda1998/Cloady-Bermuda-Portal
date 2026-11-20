@@ -258,6 +258,9 @@ type Gateway struct {
 	cloudflareDomain string
 	region           string
 
+	loggedLiveCL atomic.Bool
+	loggedLiveCF atomic.Bool
+
 	pathXH, pathWS, pathTR          string
 	backendXH, backendWS, backendTR string
 	healthPath                      string
@@ -293,7 +296,7 @@ func newGateway(sup *Supervisor, cf *CloudflareClient, cloadyDomain, cloudflareD
 		if cleanCF == "" {
 			cleanCF = cleanHost(cf.CachedZoneDomain())
 		}
-		if discoveredCL := cleanHost(cf.GetCloadyOrigin()); discoveredCL != "" {
+		if discoveredCL := cleanHost(cf.GetCloadyOrigin()); isCloadyPublicDomain(discoveredCL) {
 			if cleanCL == "" || (!isFullCloadyServiceDomain(cleanCL) && isFullCloadyServiceDomain(discoveredCL)) {
 				cleanCL = discoveredCL
 			}
@@ -334,6 +337,12 @@ func newGateway(sup *Supervisor, cf *CloudflareClient, cloadyDomain, cloudflareD
 		startedAt:        time.Now(),
 		dialer:           net.Dialer{Timeout: backendDialTimeout, KeepAlive: -1},
 	}
+	if isCloadyPublicDomain(cleanCL) {
+		g.loggedLiveCL.Store(true)
+	}
+	if cleanCF != "" && !isCloadyManagedDomain(cleanCF) {
+		g.loggedLiveCF.Store(true)
+	}
 	g.tr = newLoopbackTransport(transportBuf)
 	proxy, err := newBackendProxy(g.backendXH, g.tr, g.bufPool)
 	if err != nil {
@@ -353,11 +362,13 @@ func (g *Gateway) SetCloadyClient(cl *CloadyClient) {
 		if clDom := cleanHost(cl.GetServiceDomain()); isCloadyPublicDomain(clDom) {
 			if g.cloadyDomain == "" || (!isFullCloadyServiceDomain(g.cloadyDomain) && isFullCloadyServiceDomain(clDom)) {
 				g.cloadyDomain = clDom
+				g.loggedLiveCL.Store(true)
 			}
 		}
 		if cfDom := cleanHost(cl.GetCustomDomain()); cfDom != "" && !isCloadyManagedDomain(cfDom) {
 			if g.cloudflareDomain == "" {
 				g.cloudflareDomain = cfDom
+				g.loggedLiveCF.Store(true)
 			}
 		}
 	}
@@ -375,10 +386,12 @@ func (g *Gateway) SetInfrastructureDomains(cloadyDom, cfDom, reg string) {
 	if isCloadyPublicDomain(cleanCL) {
 		if g.cloadyDomain == "" || (!isFullCloadyServiceDomain(g.cloadyDomain) && isFullCloadyServiceDomain(cleanCL)) {
 			g.cloadyDomain = cleanCL
+			g.loggedLiveCL.Store(true)
 		}
 	}
 	if cleanCF != "" && !isCloadyManagedDomain(cleanCF) {
 		g.cloudflareDomain = cleanCF
+		g.loggedLiveCF.Store(true)
 	}
 	if strings.TrimSpace(reg) != "" {
 		g.region = strings.TrimSpace(reg)
@@ -386,27 +399,49 @@ func (g *Gateway) SetInfrastructureDomains(cloadyDom, cfDom, reg string) {
 	g.domainMu.Unlock()
 }
 
+func extractRequestHost(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	if h := cleanHost(r.Host); !isLocalLoopbackHost(h) {
+		return h
+	}
+	for _, hdr := range []string{"X-Forwarded-Host", "X-Original-Host"} {
+		if raw := strings.TrimSpace(r.Header.Get(hdr)); raw != "" {
+			first, _, _ := strings.Cut(raw, ",")
+			if h := cleanHost(first); !isLocalLoopbackHost(h) {
+				return h
+			}
+		}
+	}
+	return cleanHost(r.Host)
+}
+
 func (g *Gateway) observeRequestHost(reqHost string) {
 	if g == nil || reqHost == "" {
 		return
 	}
-	g.domainMu.RLock()
-	hasCL := isFullCloadyServiceDomain(g.cloadyDomain)
-	hasCF := g.cloudflareDomain != ""
-	cl := g.cl
-	cf := g.cf
-	g.domainMu.RUnlock()
-
-	if hasCL && hasCF {
-		return
-	}
-
 	clean := cleanHost(reqHost)
 	if isLocalLoopbackHost(clean) {
 		return
 	}
 
-	if isCloadyPublicDomain(clean) && !hasCL {
+	g.domainMu.RLock()
+	curCL := g.cloadyDomain
+	curCF := g.cloudflareDomain
+	cl := g.cl
+	cf := g.cf
+	g.domainMu.RUnlock()
+
+	if clean == curCL || clean == curCF {
+		return
+	}
+
+	if isCloadyPublicDomain(clean) {
+		shouldUpdate := curCL == "" || (!isFullCloadyServiceDomain(curCL) && isFullCloadyServiceDomain(clean))
+		if !shouldUpdate {
+			return
+		}
 		g.SetInfrastructureDomains(clean, "", "")
 		if g.sup != nil {
 			g.sup.SetInfrastructureDomains(clean, "", "")
@@ -417,7 +452,18 @@ func (g *Gateway) observeRequestHost(reqHost string) {
 		if cl != nil {
 			cl.SetServiceDomain(clean)
 		}
-	} else if !isCloadyManagedDomain(clean) && !hasCF {
+		if g.loggedLiveCL.CompareAndSwap(false, true) && g.sup != nil {
+			log.Printf("[Gateway] ✓ Auto-discovered live Cloady Service Domain from incoming request: %s", clean)
+			go g.sup.LogProvisioningLink(clean)
+		}
+		return
+	}
+
+	if !isCloadyManagedDomain(clean) {
+		shouldUpdate := curCF == "" || strings.HasSuffix(clean, "."+curCF)
+		if !shouldUpdate {
+			return
+		}
 		g.SetInfrastructureDomains("", clean, "")
 		if g.sup != nil {
 			g.sup.SetInfrastructureDomains("", clean, "")
@@ -427,6 +473,10 @@ func (g *Gateway) observeRequestHost(reqHost string) {
 		}
 		if cl != nil {
 			cl.SetCustomDomain(clean)
+		}
+		if g.loggedLiveCF.CompareAndSwap(false, true) && g.sup != nil {
+			log.Printf("[Gateway] ✓ Auto-discovered live Custom Domain from incoming request: %s", clean)
+			go g.sup.LogProvisioningLink(clean)
 		}
 	}
 }
@@ -871,6 +921,9 @@ func (g *Gateway) generatePortalBundle(reqHost string) (string, map[string]any, 
 		supCL, supCF, supReg = g.sup.GetInfrastructureDomains()
 	}
 
+	var newlyLearnedCL string
+	var newlyLearnedCF string
+
 	g.domainMu.Lock()
 	if isCloadyPublicDomain(supCL) && (g.cloadyDomain == "" || (!isFullCloadyServiceDomain(g.cloadyDomain) && isFullCloadyServiceDomain(supCL))) {
 		g.cloadyDomain = supCL
@@ -912,6 +965,7 @@ func (g *Gateway) generatePortalBundle(reqHost string) (string, map[string]any, 
 		if isCloadyPublicDomain(cleanReqHost) {
 			if g.cloadyDomain == "" || (!isFullCloadyServiceDomain(g.cloadyDomain) && isFullCloadyServiceDomain(cleanReqHost)) {
 				g.cloadyDomain = cleanReqHost
+				newlyLearnedCL = cleanReqHost
 			}
 			if g.cf != nil {
 				g.cf.SetCloadyOrigin(cleanReqHost)
@@ -922,6 +976,7 @@ func (g *Gateway) generatePortalBundle(reqHost string) (string, map[string]any, 
 		} else if !isCloadyManagedDomain(cleanReqHost) {
 			if g.cloudflareDomain == "" || strings.HasSuffix(cleanReqHost, "."+g.cloudflareDomain) {
 				g.cloudflareDomain = cleanReqHost
+				newlyLearnedCF = cleanReqHost
 			}
 			if g.cf != nil {
 				g.cf.SetPreferredDomain(cleanReqHost)
@@ -937,8 +992,18 @@ func (g *Gateway) generatePortalBundle(reqHost string) (string, map[string]any, 
 	reg := g.region
 	g.domainMu.Unlock()
 
+	if reg == "" {
+		rawReg := getEnv("CLOADY_REGION", getEnv("BERMUDA_REGION", getEnv("REGION", "")))
+		reg = normalizeRegion(rawReg)
+	}
+
 	if g.sup != nil {
 		g.sup.SetInfrastructureDomains(cloadyDom, cfDomain, reg)
+		if newlyLearnedCL != "" && g.loggedLiveCL.CompareAndSwap(false, true) {
+			go g.sup.LogProvisioningLink(newlyLearnedCL)
+		} else if newlyLearnedCF != "" && g.loggedLiveCF.CompareAndSwap(false, true) {
+			go g.sup.LogProvisioningLink(newlyLearnedCF)
+		}
 	}
 
 	activeDom := cfDomain
@@ -1009,7 +1074,8 @@ func (g *Gateway) setPortalSessionCookie(w http.ResponseWriter) {
 }
 
 func (g *Gateway) servePortalPanel(w http.ResponseWriter, r *http.Request, setCookie bool) {
-	token, bundle, err := g.generatePortalBundle(r.Host)
+	reqHost := extractRequestHost(r)
+	token, bundle, err := g.generatePortalBundle(reqHost)
 	if err != nil {
 		writeStandardPage(w, r, http.StatusBadGateway, openresty50xHTML, nil)
 		return
@@ -1061,7 +1127,7 @@ func (g *Gateway) servePortalPanel(w http.ResponseWriter, r *http.Request, setCo
 func (g *Gateway) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		g.totalReq.Add(1)
-		g.observeRequestHost(r.Host)
+		g.observeRequestHost(extractRequestHost(r))
 
 		if r.URL.RawQuery != "" {
 			q := r.URL.Query()
