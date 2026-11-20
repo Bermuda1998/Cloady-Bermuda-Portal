@@ -221,7 +221,7 @@ func sanitizeCloadyToken(raw string) string {
 		}
 		return r
 	}, s)
-	if strings.Contains(s, "${{") || strings.HasPrefix(s, "$") {
+	if strings.Contains(s, "${") || strings.HasPrefix(s, "$") {
 		return ""
 	}
 	return s
@@ -282,7 +282,7 @@ func NewCloadyClient(token string) *CloadyClient {
 	}
 
 	platformReg := normalizeOptionalRegion(getEnv("CLOADY_REGION", ""))
-	explicitReg := normalizeOptionalRegion(getEnv("BERMUDA_REGION", ""))
+	explicitReg := normalizeOptionalRegion(getEnv("BERMUDA_REGION", getEnv("REGION", "")))
 	discReg := platformReg
 	regConfirmed := platformReg != ""
 	if discReg == "" && explicitReg != "" {
@@ -732,12 +732,10 @@ func parseCloadyAppMap(m map[string]any, wsSlug string) clAppCandidate {
 		}
 	}
 
-	// Primary source in Cloady API: endpoints: [{ component, url }]
 	if dom := extractBestCloadyEndpoint(m["endpoints"]); dom != "" {
 		cand.ServiceDomain = dom
 	}
 
-	// Secondary source: flat URL/domain fields
 	if !isFullCloadyServiceDomain(cand.ServiceDomain) {
 		for _, k := range []string{"primaryHost", "primaryUrl", "url", "domain", "defaultDomain", "hostname", "publicUrl", "fqdn"} {
 			if s := clAnyToString(m[k]); s != "" {
@@ -753,7 +751,6 @@ func parseCloadyAppMap(m map[string]any, wsSlug string) clAppCandidate {
 		}
 	}
 
-	// Tertiary source: nested subServices / components endpoints
 	if !isFullCloadyServiceDomain(cand.ServiceDomain) {
 		for _, subKey := range []string{"subServices", "components"} {
 			if subs, ok := m[subKey].([]any); ok {
@@ -1248,7 +1245,7 @@ func (c *CloadyClient) PersistMasterKey(ctx context.Context, masterKey string) b
 }
 
 func (c *CloadyClient) EnsureServiceDomain(ctx context.Context) (string, error) {
-	if dom := c.GetServiceDomain(); isFullCloadyServiceDomain(dom) {
+	if dom := c.GetServiceDomain(); isFullCloadyServiceDomain(dom) && c.GetDiscoveredRegion() != "" {
 		return dom, nil
 	}
 	if !c.IsConfigured() {
@@ -2068,6 +2065,77 @@ func probeKernelIPv6Route() bool {
 	return false
 }
 
+// probeOutboundCloadyRegion auto-detects which of Cloady's 9 official regions
+// (aus1, eu1, ind1, jpn1, sin1, uk1, usc1, use1, usw1) the container is running in
+// when neither BERMUDA_REGION nor CLOADY_API_TOKEN is provided.
+func probeOutboundCloadyRegion(parent context.Context) string {
+	ctx, cancel := context.WithTimeout(parent, 1500*time.Millisecond)
+	defer cancel()
+
+	client := &http.Client{Timeout: 1500 * time.Millisecond}
+	for _, traceURL := range []string{"https://1.1.1.1/cdn-cgi/trace", "https://cloudflare.com/cdn-cgi/trace"} {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, traceURL, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", "curl/8.7.1")
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		rawBytes, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
+		if readErr != nil || resp.StatusCode != http.StatusOK {
+			continue
+		}
+
+		var loc, colo string
+		for _, line := range strings.Split(string(rawBytes), "\n") {
+			k, v, ok := strings.Cut(strings.TrimSpace(line), "=")
+			if !ok {
+				continue
+			}
+			switch strings.ToLower(strings.TrimSpace(k)) {
+			case "loc":
+				loc = strings.ToUpper(strings.TrimSpace(v))
+			case "colo":
+				colo = strings.ToUpper(strings.TrimSpace(v))
+			}
+		}
+
+		switch loc {
+		case "AU", "NZ":
+			return "aus1"
+		case "IN":
+			return "ind1"
+		case "JP", "KR":
+			return "jpn1"
+		case "SG", "MY", "ID", "TH", "VN", "PH", "HK":
+			return "sin1"
+		case "GB", "UK":
+			return "uk1"
+		case "DE":
+			return "eu1"
+		case "US", "CA":
+			switch colo {
+			case "SJC", "LAX", "SFO", "SEA", "PDX", "PHX", "LAS", "SAN", "SLC", "SMF", "ONT", "BUR", "RNO", "BOI", "GEG", "HNL", "ANC", "YVR":
+				return "usw1"
+			case "ORD", "DFW", "IAH", "MCI", "MSP", "DEN", "AUS", "SAT", "OMA", "OKC", "TUL", "MEM", "BNA", "IND", "DTW", "MKE", "DSM", "YWG":
+				return "usc1"
+			default:
+				return "use1"
+			}
+		}
+		if loc != "" {
+			if colo == "LHR" || colo == "MAN" || colo == "EDI" {
+				return "uk1"
+			}
+			return "eu1"
+		}
+	}
+	return ""
+}
+
 func (c *CloadyClient) TuneComputeAndNetwork(ctx context.Context) {
 	if probeKernelIPv6Route() {
 		log.Println("[Cloady] ✓ Outbound IPv6 Stack: ACTIVE & VERIFIED (Dual-Stack Egress Online)")
@@ -2078,7 +2146,7 @@ func (c *CloadyClient) TuneComputeAndNetwork(ctx context.Context) {
 	if !c.IsConfigured() {
 		return
 	}
-	if !c.HasServiceContext() {
+	if !c.HasServiceContext() || c.GetDiscoveredRegion() == "" || !isCloadyPublicDomain(c.GetServiceDomain()) {
 		_ = c.ResolveRuntimeContext(ctx)
 	}
 
