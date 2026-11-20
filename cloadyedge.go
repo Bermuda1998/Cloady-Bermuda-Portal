@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 )
@@ -28,6 +29,7 @@ const (
 	defaultCLTLSProbeTimeout = 6 * time.Second
 	defaultCLTargetPort      = 8080
 	minCLRequestInterval     = 500 * time.Millisecond
+	ipv6ProbeCacheTTL        = 60 * time.Second
 )
 
 var cloudflareIPv4CIDRs = []string{
@@ -61,6 +63,10 @@ var cloudflareIPv6CIDRs = []string{
 var (
 	cfNetsOnce sync.Once
 	cfNets     []*net.IPNet
+
+	ipv6ProbeMu      sync.Mutex
+	ipv6ProbeChecked time.Time
+	ipv6ProbeResult  bool
 )
 
 func isCloudflareEdgeIP(ip net.IP) bool {
@@ -173,19 +179,20 @@ type CloadyClient struct {
 	apiBase       string
 	client        *http.Client
 
-	reqMu   sync.Mutex
-	lastReq time.Time
+	reqMu      sync.Mutex
+	lastReq    time.Time
+	authFailed atomic.Bool
 
-	mu                    sync.RWMutex
-	serviceDomain         string
-	customDomain          string
-	discoveredRegion      string
-	regionConfirmed       bool
-	certEndpointSkip      bool
-	cachedOriginIPv4      []string
-	cachedOriginIPv6      []string
-	keyPersisted          bool
-	onTopology            func(cloadyDom, cfDom string)
+	mu               sync.RWMutex
+	serviceDomain    string
+	customDomain     string
+	discoveredRegion string
+	regionConfirmed  bool
+	certEndpointSkip bool
+	cachedOriginIPv4 []string
+	cachedOriginIPv6 []string
+	keyPersisted     bool
+	onTopology       func(cloadyDom, cfDom string)
 }
 
 func sanitizeCloadyToken(raw string) string {
@@ -202,6 +209,12 @@ func sanitizeCloadyToken(raw string) string {
 		s = strings.TrimSpace(s[7:])
 	}
 	s = strings.Trim(s, "\"'` \t\r\n")
+	if idx := strings.Index(s, "cldy_"); idx > 0 {
+		s = s[idx:]
+		if fields := strings.Fields(s); len(fields) > 0 {
+			s = fields[0]
+		}
+	}
 	s = strings.Map(func(r rune) rune {
 		if unicode.IsSpace(r) || unicode.IsControl(r) || r > 126 {
 			return -1
@@ -214,9 +227,38 @@ func sanitizeCloadyToken(raw string) string {
 	return s
 }
 
+func isValidCloadyTokenFormat(tok string) bool {
+	if !strings.HasPrefix(tok, "cldy_") || len(tok) < 16 {
+		return false
+	}
+	for i := 5; i < len(tok); i++ {
+		c := tok[i]
+		isAlphaNum := (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+		if !isAlphaNum && c != '_' && c != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func maskCloadyTokenPreview(tok string) string {
+	if tok == "" {
+		return "empty"
+	}
+	if strings.HasPrefix(tok, "cldy_") {
+		return fmt.Sprintf("prefix=\"cldy_\", len=%d", len(tok))
+	}
+	return fmt.Sprintf("prefix=\"non-cldy\", len=%d", len(tok))
+}
+
 func NewCloadyClient(token string) *CloadyClient {
 	cleanTok := sanitizeCloadyToken(token)
 	if cleanTok == "" {
+		return nil
+	}
+	if !isValidCloadyTokenFormat(cleanTok) {
+		log.Printf("[Cloady] Warning: Ignoring invalid CLOADY_API_TOKEN (%s): Cloady tokens must start with 'cldy_' (create one at cloady.com -> Avatar -> API tokens -> + New token). Continuing in Direct Mode.",
+			maskCloadyTokenPreview(cleanTok))
 		return nil
 	}
 
@@ -265,7 +307,7 @@ func NewCloadyClient(token string) *CloadyClient {
 }
 
 func (c *CloadyClient) IsConfigured() bool {
-	return c != nil && c.Token != ""
+	return c != nil && c.Token != "" && !c.authFailed.Load()
 }
 
 func (c *CloadyClient) HasServiceContext() bool {
@@ -437,8 +479,14 @@ func extractCloadyErrorMessage(rawBytes []byte) string {
 }
 
 func doCLRequest(ctx context.Context, c *CloadyClient, method, path string, body any) ([]byte, int, error) {
-	if !c.IsConfigured() {
+	if c == nil || c.Token == "" {
 		return nil, 0, errors.New("cloady client not configured")
+	}
+	if c.authFailed.Load() {
+		return nil, http.StatusUnauthorized, &clAPIError{
+			StatusCode: http.StatusUnauthorized,
+			Message:    "cloady api token previously rejected (HTTP 401)",
+		}
 	}
 
 	var reqBytes []byte
@@ -500,9 +548,19 @@ func doCLRequest(ctx context.Context, c *CloadyClient, method, path string, body
 		}
 
 		if resp.StatusCode >= 400 {
+			errMsg := extractCloadyErrorMessage(rawBytes)
+			if resp.StatusCode == http.StatusUnauthorized {
+				if c.authFailed.CompareAndSwap(false, true) {
+					log.Printf("[Cloady] Warning: CLOADY_API_TOKEN (%s) was rejected by Cloady API (HTTP 401: %s). Direct *.cloady.io tunnel remains 100%% active; regenerate a 'cldy_...' token at cloady.com -> Avatar -> API tokens only if you need automated API discovery.",
+						maskCloadyTokenPreview(c.Token), errMsg)
+				}
+			} else if resp.StatusCode == http.StatusForbidden {
+				log.Printf("[Cloady] Warning: CLOADY_API_TOKEN (%s) returned HTTP 403 Forbidden (%s). Ensure the token has 'read' scope (for Direct Mode) or 'deploy' scope (for Custom Domains) and is not pinned to a different workspace.",
+					maskCloadyTokenPreview(c.Token), errMsg)
+			}
 			return rawBytes, resp.StatusCode, &clAPIError{
 				StatusCode: resp.StatusCode,
-				Message:    extractCloadyErrorMessage(rawBytes),
+				Message:    errMsg,
 			}
 		}
 
@@ -713,6 +771,11 @@ func parseCloadyAppMap(m map[string]any, wsSlug string) clAppCandidate {
 							cand.ServiceDomain = clean
 							break
 						}
+						if cand.ServiceDomain == "" {
+							if clean := cleanHost(clAnyToString(subMap[k])); isCloadyPublicDomain(clean) {
+								cand.ServiceDomain = clean
+							}
+						}
 					}
 					if isFullCloadyServiceDomain(cand.ServiceDomain) {
 						break
@@ -746,7 +809,6 @@ func extractCloadyAppsFromMap(v map[string]any, wsSlug string) []clAppCandidate 
 		out = append(out, cand)
 	}
 
-	// Unwrap workspace container if present
 	if wsObj, ok := v["workspace"].(map[string]any); ok && len(wsObj) > 0 {
 		if slug := clAnyToString(wsObj["slug"]); slug != "" && wsSlug == "" {
 			wsSlug = slug
@@ -754,7 +816,6 @@ func extractCloadyAppsFromMap(v map[string]any, wsSlug string) []clAppCandidate 
 		v = wsObj
 	}
 
-	// Cloady official workspace/app response uses "services"
 	for _, key := range []string{"services", "apps", "applications", "data", "items", "results"} {
 		if arr, ok := v[key].([]any); ok {
 			for _, item := range arr {
@@ -838,7 +899,6 @@ func extractWorkspacesFromJSON(rawBytes []byte) []clWorkspaceCandidate {
 		}
 		seen[cand.Slug] = struct{}{}
 
-		// Capture inline services returned directly inside listWorkspaces
 		for _, svcKey := range []string{"services", "apps", "applications"} {
 			if arr, ok := m[svcKey].([]any); ok && len(arr) > 0 {
 				for _, item := range arr {
@@ -906,6 +966,9 @@ func (c *CloadyClient) applyAppCandidate(cand clAppCandidate) {
 }
 
 func (c *CloadyClient) enrichAppDetails(ctx context.Context) {
+	if !c.IsConfigured() {
+		return
+	}
 	c.mu.RLock()
 	ws := c.WorkspaceSlug
 	app := c.AppSlug
@@ -914,7 +977,6 @@ func (c *CloadyClient) enrichAppDetails(ctx context.Context) {
 		return
 	}
 
-	// 1. Official getWorkspace endpoint returns full service list including endpoints & region
 	wsPath := fmt.Sprintf("/workspaces/%s", url.PathEscape(ws))
 	if raw, _, err := doCLRequest(ctx, c, http.MethodGet, wsPath, nil); err == nil && len(raw) > 0 {
 		for _, cand := range extractCloadyAppsFromJSON(raw, ws) {
@@ -925,8 +987,7 @@ func (c *CloadyClient) enrichAppDetails(ctx context.Context) {
 		}
 	}
 
-	// 2. Fallback/supplement via direct app detail endpoint
-	if !isFullCloadyServiceDomain(c.GetServiceDomain()) || c.GetDiscoveredRegion() == "" {
+	if !isCloadyPublicDomain(c.GetServiceDomain()) || c.GetDiscoveredRegion() == "" {
 		appPath := fmt.Sprintf("/workspaces/%s/apps/%s", url.PathEscape(ws), url.PathEscape(app))
 		if raw, _, err := c.doCLAppRequest(ctx, http.MethodGet, appPath, nil); err == nil && len(raw) > 0 {
 			cands := extractCloadyAppsFromJSON(raw, ws)
@@ -950,7 +1011,7 @@ func (c *CloadyClient) ResolveRuntimeContext(ctx context.Context) error {
 	c.mu.RUnlock()
 
 	if wsSlug != "" && appSlug != "" {
-		if !isFullCloadyServiceDomain(srvDom) || !regConfirmed {
+		if !isCloadyPublicDomain(srvDom) || !regConfirmed {
 			c.enrichAppDetails(ctx)
 		}
 		return nil
@@ -997,7 +1058,6 @@ func (c *CloadyClient) ResolveRuntimeContext(ctx context.Context) error {
 	for _, ws := range workspaces {
 		apps := ws.Services
 
-		// Official Cloady getWorkspace endpoint: GET /api/workspaces/{workspaceSlug} -> { services: [...] }
 		if len(apps) == 0 {
 			wsDetailPath := fmt.Sprintf("/workspaces/%s", url.PathEscape(ws.Slug))
 			if raw, _, err := doCLRequest(ctx, c, http.MethodGet, wsDetailPath, nil); err == nil && len(raw) > 0 {
@@ -1005,7 +1065,6 @@ func (c *CloadyClient) ResolveRuntimeContext(ctx context.Context) error {
 			}
 		}
 
-		// Secondary fallback if an API revision exposes /workspaces/{ws}/apps
 		if len(apps) == 0 {
 			appsPath := fmt.Sprintf("/workspaces/%s/apps", url.PathEscape(ws.Slug))
 			if raw, _, err := doCLRequest(ctx, c, http.MethodGet, appsPath, nil); err == nil && len(raw) > 0 {
@@ -1037,7 +1096,7 @@ func (c *CloadyClient) ResolveRuntimeContext(ctx context.Context) error {
 	}
 
 	c.applyAppCandidate(*matched)
-	if !isFullCloadyServiceDomain(c.GetServiceDomain()) || c.GetDiscoveredRegion() == "" {
+	if !isCloadyPublicDomain(c.GetServiceDomain()) || c.GetDiscoveredRegion() == "" {
 		c.enrichAppDetails(ctx)
 	}
 	log.Printf("[Cloady] ✓ Application context resolved: Workspace=%s | App=%s | Domain=%q | Region=%q",
@@ -1142,7 +1201,6 @@ func (c *CloadyClient) PersistMasterKey(ctx context.Context, masterKey string) b
 	cleanKey := strings.TrimSpace(masterKey)
 	var writeErr error
 
-	// If an empty BERMUDA_MASTER_KEY variable already exists, update it in place to avoid HTTP 409 Conflict
 	if existingEmptyID != "" {
 		updatePath := baseVarsPath + "/" + url.PathEscape(existingEmptyID)
 		updatePayload := map[string]any{
@@ -1193,6 +1251,9 @@ func (c *CloadyClient) EnsureServiceDomain(ctx context.Context) (string, error) 
 	if dom := c.GetServiceDomain(); isFullCloadyServiceDomain(dom) {
 		return dom, nil
 	}
+	if !c.IsConfigured() {
+		return c.GetServiceDomain(), nil
+	}
 	if err := c.ResolveRuntimeContext(ctx); err != nil {
 		return c.GetServiceDomain(), err
 	}
@@ -1229,7 +1290,7 @@ func (c *CloadyClient) CheckPublicDNS(ctx context.Context, targetDomain string) 
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "BERMUDA-Portal-CloudOrchestrator/4.0 (Go-Standard-Library)")
-	if c != nil && c.Token != "" {
+	if c != nil && c.Token != "" && !c.authFailed.Load() {
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
 
@@ -1315,7 +1376,6 @@ func parseCloadyDomainMap(m map[string]any, fallbackCNAME string) CloadyCustomDo
 		info.ID = clAnyToString(m["domainId"])
 	}
 
-	// Cloady official custom domain attribute is "host" (cloady_domain.host)
 	for _, k := range []string{"host", "domain", "hostname", "domainName", "name", "fqdn"} {
 		if s := clAnyToString(m[k]); s != "" {
 			info.Domain = cleanHost(s)
@@ -1637,7 +1697,6 @@ func probeCustomDomainTLSWithExtraIPs(ctx context.Context, customDomain, gateway
 
 	originIPs := resolveOriginIngressIPs(ctx, gatewayHost, extraIPs)
 	if len(originIPs) == 0 {
-		// Fallback: query Cloady's public /api/dns endpoint for authoritative origin A/AAAA targets
 		if dnsRes, err := (*CloadyClient)(nil).CheckPublicDNS(ctx, cleanCustom); err == nil && dnsRes != nil {
 			var fallbackExtra []string
 			fallbackExtra = append(fallbackExtra, dnsRes.TargetsA...)
@@ -1719,7 +1778,6 @@ func probeCustomDomainTLSWithExtraIPs(ctx context.Context, customDomain, gateway
 			}
 		}
 
-		// Proxy-proof route identity verification (immune to Traefik/edge Server header rewrites)
 		normETag := strings.TrimPrefix(strings.TrimSpace(resp.Header.Get("ETag")), "W/")
 		etagMatch := normETag == openrestyIndexETag
 		lastModMatch := strings.EqualFold(strings.TrimSpace(resp.Header.Get("Last-Modified")), openrestyIndexLastModified)
@@ -1744,14 +1802,12 @@ func (c *CloadyClient) finalizeCustomDomainInfo(ctx context.Context, info Cloady
 		info.CNAMETarget = c.GetServiceDomain()
 	}
 
-	// Merge official cert status endpoint if available
 	if !info.IsCertificateValid() {
 		if certSt, ok := c.fetchCertStatusForDomain(ctx, info.Domain); ok && certSt != "" {
 			info.CertificateStatus = certSt
 		}
 	}
 
-	// Attach cached or live Cloady origin A/AAAA targets and DNS readiness state
 	v4, v6 := c.getCachedOriginIPs()
 	if len(v4) == 0 && len(v6) == 0 && info.Domain != "" {
 		if dnsRes, err := c.CheckPublicDNS(ctx, info.Domain); err == nil && dnsRes != nil {
@@ -1836,14 +1892,12 @@ func (c *CloadyClient) EnsureCustomDomain(ctx context.Context, targetDomain stri
 
 	basePath := fmt.Sprintf("/workspaces/%s/apps/%s/domains", url.PathEscape(ws), url.PathEscape(app))
 
-	// Primary Cloady API contract uses "host" (cloady_domain.host)
 	raw, _, postErr := c.doCLAppRequest(ctx, http.MethodPost, basePath, map[string]any{
 		"host": cleanTarget,
 	})
 	if postErr != nil {
 		var apiErr *clAPIError
 		if errors.As(postErr, &apiErr) && (apiErr.StatusCode == http.StatusBadRequest || apiErr.StatusCode == http.StatusUnprocessableEntity) {
-			// Secondary fallback if API schema expects "domain"
 			raw2, _, err2 := c.doCLAppRequest(ctx, http.MethodPost, basePath, map[string]any{
 				"domain": cleanTarget,
 			})
@@ -1902,11 +1956,13 @@ func (c *CloadyClient) FetchCustomDomainStatus(ctx context.Context, customDomain
 	cleanTarget := cleanHost(targetDomain)
 	cnameTarget := c.GetServiceDomain()
 
-	if err := c.ResolveRuntimeContext(ctx); err == nil {
-		if doms, listErr := c.listDomainsRaw(ctx); listErr == nil {
-			for _, d := range doms {
-				if (customDomainID != "" && d.ID == customDomainID) || (cleanTarget != "" && cleanHost(d.Domain) == cleanTarget) {
-					return c.finalizeCustomDomainInfo(ctx, d), nil
+	if c.IsConfigured() {
+		if err := c.ResolveRuntimeContext(ctx); err == nil {
+			if doms, listErr := c.listDomainsRaw(ctx); listErr == nil {
+				for _, d := range doms {
+					if (customDomainID != "" && d.ID == customDomainID) || (cleanTarget != "" && cleanHost(d.Domain) == cleanTarget) {
+						return c.finalizeCustomDomainInfo(ctx, d), nil
+					}
 				}
 			}
 		}
@@ -1980,12 +2036,36 @@ func (c *CloadyClient) WaitCustomDomainCertificate(ctx context.Context, customDo
 }
 
 func probeKernelIPv6Route() bool {
-	conn, err := net.DialTimeout("udp6", "[2606:4700:4700::1111]:53", 50*time.Millisecond)
+	ipv6ProbeMu.Lock()
+	defer ipv6ProbeMu.Unlock()
+
+	if !ipv6ProbeChecked.IsZero() && time.Since(ipv6ProbeChecked) < ipv6ProbeCacheTTL {
+		return ipv6ProbeResult
+	}
+
+	// Stage 1: Fast kernel routing table check (<1ms)
+	udpConn, err := net.DialTimeout("udp6", "[2606:4700:4700::1111]:53", 25*time.Millisecond)
 	if err != nil {
+		ipv6ProbeResult = false
+		ipv6ProbeChecked = time.Now()
 		return false
 	}
-	_ = conn.Close()
-	return true
+	_ = udpConn.Close()
+
+	// Stage 2: Verify real end-to-end TCPv6 packet reachability
+	for _, target := range []string{"[2606:4700:4700::1111]:443", "[2001:4860:4860::8888]:443"} {
+		tcpConn, dialErr := net.DialTimeout("tcp6", target, 350*time.Millisecond)
+		if dialErr == nil {
+			_ = tcpConn.Close()
+			ipv6ProbeResult = true
+			ipv6ProbeChecked = time.Now()
+			return true
+		}
+	}
+
+	ipv6ProbeResult = false
+	ipv6ProbeChecked = time.Now()
+	return false
 }
 
 func (c *CloadyClient) TuneComputeAndNetwork(ctx context.Context) {
